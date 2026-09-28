@@ -132,9 +132,10 @@ helpers and `main` as they are. Rules for the script:
   splits the whole layout, so each new plot takes half the window and the earlier
   ones shrink to 1/4, 1/8, 1/16. `workspace.equalize()` is not available in safe
   mode. At most 6 plots, one concern per plot.
-- Add every trace with `trace(plot, field, mode=..., color=...)`, never
+- Add every trace with `trace(plot, field, mode=...)`, never
   `plot.traces.add` directly: DeLOG can briefly report a just-published field as
-  `stale_handle`, and `trace` retries for up to 3 s.
+  `stale_handle`, and `trace` retries for up to 3 s. It also picks the trace color
+  (see Colors).
 - Raw evidence: trace snapshot fields directly (`topic.field(name)`), no upload. Add
   them while the snapshot is open.
 - Derived signals: compute with numpy, publish with `publish(client, name, t,
@@ -142,13 +143,13 @@ helpers and `main` as they are. Rules for the script:
   `derived.field(name)`. Units map only fields that have a unit.
   Topic names start with `da_` and are lowercase snake_case (`da_vibration_magnitude`),
   so they never collide with a log topic such as `battery_status`.
-- Markers (`client.markers.add(time_ns, label, note=..., color=...)`) for discrete
+- Markers (`mark(client, time_ns, label, note=..., color=RED)`) for discrete
   events on the timeline: failsafe, mode change, crash, onset of a problem. Put the
   evidence in `note` (values, thresholds). At most 20; keep the most important.
-- Annotations on the plot where the evidence is:
-  - `plot.annotations.add_hline(y, label=...)` for a threshold;
-  - `plot.annotations.add_rect((t0, y0), (t1, y1), label=..., fill_opacity=0.15)` over a problem interval;
-  - `plot.annotations.add_text(time_ns=t, value=y, text=...)` at a peak or exceedance.
+- Annotations on the plot where the evidence is, always through `annotate`:
+  - `annotate(plot, "hline", y, label=...)` for a threshold;
+  - `annotate(plot, "rect", (t0, y0), (t1, y1), label=..., fill_opacity=0.15)` over a problem interval;
+  - `annotate(plot, "text", time_ns=t, value=y, text=...)` at a peak or exceedance.
   Every `value`/`y` must be finite: wrap with `finite(...)`.
 - Every time passed to DeLOG (`markers.add`, `add_text(time_ns=...)`, the first
   element of `add_rect`/`add_segment` points) must be a Python `int`: wrap numpy
@@ -162,8 +163,24 @@ helpers and `main` as they are. Rules for the script:
   `origin_ns = log_origin_ns(snapshot)`.
 - Labels, notes, and annotation text: plain ASCII, short, no em dashes, no emoji.
 - `analyze` returns the findings lines; the first line is the verdict.
-- Colors: red `#e5484d` for failures, amber `#f5a524` for warnings, blue `#3b82f6`
-  for neutral events, green `#30a46c` for "checked, fine".
+- Colors: within one plot every trace and every annotation has its own color, and
+  none matches or resembles a marker color. Other plots may reuse the same colors.
+  - Markers draw a line across every plot, so `RED` (failure) and `BLUE` (neutral
+    event) are for markers only; `mark` rejects any other color. Markers may share
+    those two colors with each other.
+  - Traces and annotations get colors from `PLOT_COLORS` through `pick`, which
+    `trace` and `annotate` call for you. Pass `color=` only as a preference: `AMBER`
+    for a warning threshold or interval, `GREEN` for "checked, fine". A color
+    already taken on that plot, or a marker color, falls back to the next free one.
+  - Never pass a hex literal or a DeLOG default color: the defaults resemble
+    `RED`, `AMBER`, `BLUE` and `GREEN`. Every color is one of the constants in the
+    skeleton, chosen so no two look alike (CIE76 distance 35 or more).
+  - `PLOT_COLORS` has 7 entries, so a plot holds at most 7 traces and annotations
+    together. `pick` stops the script when a plot runs out; split the concern
+    across two plots.
+  - Two thresholds on one plot (warn and bad) need two colors: pass `AMBER` for
+    warn and let the bad one take the next free color; say which is which in the
+    labels.
 
 <!-- skeleton -->
 ```python
@@ -188,10 +205,18 @@ from delog_client import AmbiguousError, Client, DeLOG, DeLOGError, Instance, Pl
 OWNER = "delog-analyze-question_slug"
 TITLE = "Question title"
 RED = "#e5484d"
-AMBER = "#f5a524"
 BLUE = "#3b82f6"
+AMBER = "#f5a524"
 GREEN = "#30a46c"
+CYAN = "#22d3ee"
+MAGENTA = "#e879f9"
+LIME = "#a3e635"
+GRAY = "#d4d4d8"
+PURPLE = "#9333ea"
+MARKER_COLORS = (RED, BLUE)
+PLOT_COLORS = (CYAN, MAGENTA, LIME, GRAY, PURPLE, AMBER, GREEN)
 PLOTS: list[Plot] = []
+USED_COLORS: dict[str, set[str]] = {}
 
 
 def select_instance(instance_id: str | None) -> Instance:
@@ -279,7 +304,17 @@ def next_plot(client: Client, window: Window) -> Plot:
     return plot
 
 
-def trace(plot: Plot, field, **style) -> Trace:
+def pick(plot: Plot, preferred: str | None = None) -> str:
+    used = USED_COLORS.setdefault(plot.handle, set())
+    for color in (preferred, *PLOT_COLORS):
+        if color in PLOT_COLORS and color not in used:
+            used.add(color)
+            return color
+    raise SystemExit(f"plot {plot.handle} has no free color; move some traces or annotations to another plot")
+
+
+def trace(plot: Plot, field, color: str | None = None, **style) -> Trace:
+    style["color"] = pick(plot, color)
     deadline = time.monotonic() + 3.0
     while True:
         try:
@@ -288,6 +323,16 @@ def trace(plot: Plot, field, **style) -> Trace:
             if time.monotonic() > deadline:
                 raise
             time.sleep(0.05)
+
+
+def annotate(plot: Plot, kind: str, *args, color: str | None = None, **style):
+    return getattr(plot.annotations, f"add_{kind}")(*args, color=pick(plot, color), **style)
+
+
+def mark(client: Client, time_ns: int, label: str, note: str | None = None, color: str = BLUE):
+    if color not in MARKER_COLORS:
+        raise ValueError(f"marker color must be RED or BLUE, got {color!r}")
+    return client.markers.add(ns(time_ns), label, note=note, color=color)
 
 
 def publish(client: Client, name: str, t: np.ndarray, columns: dict[str, np.ndarray], units: dict[str, str], descriptions: dict[str, str]):
@@ -324,13 +369,13 @@ def analyze(client: Client, args: argparse.Namespace) -> list[str]:
     )
     plot = next_plot(client, window)
     trace(plot, derived.field("excess"))
-    plot.annotations.add_hline(0.0, label=f"limit {limit}", color=AMBER)
+    annotate(plot, "hline", 0.0, label=f"limit {limit}", color=AMBER)
     over = np.flatnonzero(np.abs(y) > limit)
     if len(over):
         first = ns(t[over[0]])
         peak = int(np.nanargmax(np.abs(y)))
-        client.markers.add(first, "FIELD over limit", note=f"abs(FIELD) > {limit}", color=RED)
-        plot.annotations.add_text(time_ns=ns(t[peak]), value=finite(abs(y[peak]) - limit), text=f"peak {finite(y[peak]):.2f}")
+        mark(client, first, "FIELD over limit", note=f"abs(FIELD) > {limit}", color=RED)
+        annotate(plot, "text", time_ns=ns(t[peak]), value=finite(abs(y[peak]) - limit), text=f"peak {finite(y[peak]):.2f}")
         findings.append(f"FIELD exceeds {limit} from t={seconds(first, origin_ns):.1f}s")
     else:
         findings.append(f"FIELD stays within {limit}")
